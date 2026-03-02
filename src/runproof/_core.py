@@ -11,6 +11,8 @@ import traceback
 import uuid
 from typing import Any
 
+from .probes import Probe
+
 ISO_UTC = "%Y-%m-%dT%H:%M:%S.%fZ"
 
 _current_run: contextvars.ContextVar["RunContext | None"] = contextvars.ContextVar("runproof_current_run", default=None)
@@ -27,11 +29,18 @@ class StepRecord:
     ended_at: str
     duration_ms: int
     args_summary: dict[str, Any] | None = None
+    reported_evidence: Any | None = None
+    measured_evidence: dict[str, Any] | None = None
     evidence: Any | None = None
     error: dict[str, str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return dataclasses.asdict(self)
+        data = dataclasses.asdict(self)
+        if data.get("reported_evidence") is None and data.get("evidence") is not None:
+            data["reported_evidence"] = data["evidence"]
+        if data.get("evidence") is None and data.get("reported_evidence") is not None:
+            data["evidence"] = data["reported_evidence"]
+        return data
 
 
 @dataclasses.dataclass
@@ -75,7 +84,7 @@ class RunContext:
         ended = _now()
         status = self._compute_status()
         receipt = RunReceipt(
-            version="0.1.0",
+            version="0.2.0",
             run_id=self.run_id,
             name=self.name,
             started_at=_fmt_dt(self.started_dt),
@@ -196,11 +205,48 @@ def _record_step(step: StepRecord) -> None:
         ctx.required_tracker[key] = prev or step.status == "success"
 
 
+def _probe_ctx(
+    *,
+    step_name: str,
+    step_kind: str,
+    started_at: str,
+    cwd: str | None = None,
+    cmd: list[str] | str | None = None,
+) -> dict[str, Any]:
+    run_ctx = _current_run.get()
+    return {
+        "step_name": step_name,
+        "step_kind": step_kind,
+        "cwd": cwd,
+        "cmd": cmd,
+        "run_id": run_ctx.run_id if run_ctx else None,
+        "started_at": started_at,
+        "observed_at": _fmt_dt(_now()),
+    }
+
+
+def _run_probe_post(
+    probes: list[Probe],
+    probe_ctx: dict[str, Any],
+    snapshots: dict[str, Any],
+) -> dict[str, Any]:
+    measured: dict[str, Any] = {}
+    for probe in probes:
+        try:
+            measured[probe.name] = _truncate_jsonable(probe.post(probe_ctx, snapshots.get(probe.name)))
+        except Exception as exc:  # noqa: BLE001
+            measured[probe.name] = {
+                "_probe_error": f"{type(exc).__name__}: {exc}",
+                "traceback": _truncate_text(traceback.format_exc(), 2000),
+            }
+    return measured
+
+
 def run(name: str, *, out_dir: str | None = None, tags: dict | None = None) -> RunContext:
     return RunContext(name=name, out_dir=out_dir, tags=tags)
 
 
-def step(name: str | None = None, *, required: bool = False):
+def step(name: str | None = None, *, required: bool = False, probes: list[Probe] | None = None):
     def decorator(func):
         step_name = name or func.__name__
 
@@ -221,18 +267,32 @@ def step(name: str | None = None, *, required: bool = False):
                 duration_ms=0,
                 args_summary=_args_summary(args, kwargs),
             )
+            active_probes = probes or []
+            probe_ctx = _probe_ctx(step_name=step_name, step_kind="function", started_at=record.started_at)
+            snapshots: dict[str, Any] = {}
+            for probe in active_probes:
+                try:
+                    snapshots[probe.name] = probe.pre(probe_ctx)
+                except Exception as exc:  # noqa: BLE001
+                    snapshots[probe.name] = {
+                        "_probe_error": f"{type(exc).__name__}: {exc}",
+                        "traceback": _truncate_text(traceback.format_exc(), 2000),
+                    }
             try:
                 result = func(*args, **kwargs)
                 if _is_json_primitive(result):
-                    record.evidence = _truncate_jsonable(result)
+                    record.reported_evidence = _truncate_jsonable(result)
                 else:
-                    record.evidence = {"_type": type(result).__name__, "_repr": _truncate_text(repr(result), 500)}
+                    record.reported_evidence = {"_type": type(result).__name__, "_repr": _truncate_text(repr(result), 500)}
+                record.evidence = record.reported_evidence
                 return result
             except Exception as exc:  # noqa: BLE001
                 record.status = "failed"
                 record.error = _error_dict(exc)
                 raise
             finally:
+                if active_probes:
+                    record.measured_evidence = _run_probe_post(active_probes, probe_ctx, snapshots)
                 ended = _now()
                 record.ended_at = _fmt_dt(ended)
                 record.duration_ms = _duration_ms(started, ended)
@@ -257,6 +317,7 @@ def exec(
     shell: bool = False,
     capture_output: bool = True,
     expect_files: list[str] | None = None,
+    probes: list[Probe] | None = None,
 ):
     step_name = name or (cmd if isinstance(cmd, str) else " ".join(cmd))
     started = _now()
@@ -270,6 +331,17 @@ def exec(
         ended_at=_fmt_dt(started),
         duration_ms=0,
     )
+    active_probes = probes or []
+    probe_ctx = _probe_ctx(step_name=step_name, step_kind="exec", started_at=record.started_at, cwd=cwd, cmd=cmd)
+    snapshots: dict[str, Any] = {}
+    for probe in active_probes:
+        try:
+            snapshots[probe.name] = probe.pre(probe_ctx)
+        except Exception as exc:  # noqa: BLE001
+            snapshots[probe.name] = {
+                "_probe_error": f"{type(exc).__name__}: {exc}",
+                "traceback": _truncate_text(traceback.format_exc(), 2000),
+            }
     try:
         completed = subprocess.run(  # noqa: S603
             cmd,
@@ -302,7 +374,8 @@ def exec(
                     }
                 expected_files[file_path] = file_info
             evidence["expected_files"] = expected_files
-        record.evidence = evidence
+        record.reported_evidence = evidence
+        record.evidence = record.reported_evidence
         if completed.returncode != 0:
             raise subprocess.CalledProcessError(
                 completed.returncode,
@@ -316,6 +389,8 @@ def exec(
         record.error = _error_dict(exc)
         raise
     finally:
+        if active_probes:
+            record.measured_evidence = _run_probe_post(active_probes, probe_ctx, snapshots)
         ended = _now()
         record.ended_at = _fmt_dt(ended)
         record.duration_ms = _duration_ms(started, ended)
