@@ -43,8 +43,14 @@ def _summarize_measured(step: dict) -> list[str]:
             after_state = "exists" if after.get("exists") else "missing"
             size = after.get("size")
             size_part = f" size={size}" if size is not None else ""
+            assertion = evidence.get("assertion")
+            mismatch = ""
+            if isinstance(assertion, dict) and assertion.get("ok") is False:
+                reasons = assertion.get("reasons") or []
+                reason = reasons[0] if reasons else "assertion mismatch"
+                mismatch = f" MISMATCH ({reason})"
             lines.append(
-                f"{probe_name} before:{before_state} after:{after_state}{size_part} changed={evidence.get('changed')}"
+                f"{probe_name} before:{before_state} after:{after_state}{size_part} changed={evidence.get('changed')}{mismatch}"
             )
         else:
             lines.append(f"{probe_name}: keys={','.join(list(evidence.keys())[:3])}")

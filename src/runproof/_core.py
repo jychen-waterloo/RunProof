@@ -32,7 +32,7 @@ class StepRecord:
     reported_evidence: Any | None = None
     measured_evidence: dict[str, Any] | None = None
     evidence: Any | None = None
-    error: dict[str, str] | None = None
+    error: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = dataclasses.asdict(self)
@@ -70,6 +70,7 @@ class RunContext:
         self.started_dt = _now()
         self.steps: list[StepRecord] = []
         self.required_tracker: dict[str, bool] = {}
+        self.integrity_failed = False
         self.run_exception: BaseException | None = None
         self.receipt_path: pathlib.Path | None = None
 
@@ -84,7 +85,7 @@ class RunContext:
         ended = _now()
         status = self._compute_status()
         receipt = RunReceipt(
-            version="0.2.0",
+            version="0.2.1",
             run_id=self.run_id,
             name=self.name,
             started_at=_fmt_dt(self.started_dt),
@@ -113,7 +114,7 @@ class RunContext:
     def _compute_status(self) -> str:
         any_failed = any(step.status == "failed" for step in self.steps)
         integrity_ok = all(self.required_tracker.values()) if self.required_tracker else True
-        if not integrity_ok:
+        if not integrity_ok or self.integrity_failed:
             return "integrity_failed"
         if any_failed or self.run_exception is not None:
             return "failed"
@@ -242,6 +243,48 @@ def _run_probe_post(
     return measured
 
 
+def _apply_probe_mismatch_policy(record: StepRecord) -> None:
+    measured = record.measured_evidence
+    if not isinstance(measured, dict):
+        return
+
+    mismatches: list[dict[str, Any]] = []
+    for probe_name, evidence in measured.items():
+        if not isinstance(evidence, dict):
+            continue
+        assertion = evidence.get("assertion")
+        if not isinstance(assertion, dict):
+            continue
+        if assertion.get("ok", True):
+            continue
+        mismatches.append(
+            {
+                "probe": probe_name,
+                "on_mismatch": evidence.get("on_mismatch", "record"),
+                "reasons": assertion.get("reasons") or [],
+            }
+        )
+
+    if not mismatches:
+        return
+
+    run_ctx = _current_run.get()
+    if run_ctx is not None and any(item["on_mismatch"] == "fail_run" for item in mismatches):
+        run_ctx.integrity_failed = True
+
+    step_mismatch = next((item for item in mismatches if item["on_mismatch"] == "fail_step"), None)
+    if step_mismatch and record.status != "failed":
+        record.status = "failed"
+        reasons = [str(reason) for reason in step_mismatch["reasons"]]
+        message = reasons[0] if reasons else "probe assertion mismatch"
+        record.error = {
+            "type": "ProbeMismatch",
+            "message": message,
+            "probe": str(step_mismatch["probe"]),
+            "reasons": reasons,
+        }
+
+
 def run(name: str, *, out_dir: str | None = None, tags: dict | None = None) -> RunContext:
     return RunContext(name=name, out_dir=out_dir, tags=tags)
 
@@ -293,6 +336,7 @@ def step(name: str | None = None, *, required: bool = False, probes: list[Probe]
             finally:
                 if active_probes:
                     record.measured_evidence = _run_probe_post(active_probes, probe_ctx, snapshots)
+                    _apply_probe_mismatch_policy(record)
                 ended = _now()
                 record.ended_at = _fmt_dt(ended)
                 record.duration_ms = _duration_ms(started, ended)
@@ -391,6 +435,7 @@ def exec(
     finally:
         if active_probes:
             record.measured_evidence = _run_probe_post(active_probes, probe_ctx, snapshots)
+            _apply_probe_mismatch_policy(record)
         ended = _now()
         record.ended_at = _fmt_dt(ended)
         record.duration_ms = _duration_ms(started, ended)

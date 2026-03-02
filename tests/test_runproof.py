@@ -153,3 +153,72 @@ def test_probe_failure_recorded_without_crashing(tmp_path: Path) -> None:
     step_data = receipt["steps"][0]
     assert step_data["status"] == "success"
     assert "_probe_error" in step_data["measured_evidence"]["broken"]
+
+def test_fileprobe_record_mismatch_does_not_fail_step_or_run(tmp_path: Path) -> None:
+    with run("fileprobe-record-mismatch", out_dir=str(tmp_path / "out")):
+        exec(
+            [sys.executable, "-c", "pass"],
+            cwd=str(tmp_path),
+            probes=[FileProbe("b.txt", expect={"exists": True}, on_mismatch="record")],
+        )
+
+    receipt = json.loads(_latest_receipt(tmp_path / "out").read_text(encoding="utf-8"))
+    assert receipt["status"] == "success"
+    step_data = receipt["steps"][0]
+    assert step_data["status"] == "success"
+    measured = step_data["measured_evidence"]["FileProbe:b.txt"]
+    assert measured["assertion"]["ok"] is False
+    assert measured["assertion"]["reasons"]
+
+
+def test_fileprobe_fail_step_on_mismatch(tmp_path: Path) -> None:
+    with run("fileprobe-fail-step", out_dir=str(tmp_path / "out")):
+        exec(
+            [sys.executable, "-c", "pass"],
+            cwd=str(tmp_path),
+            probes=[FileProbe("b.txt", expect={"exists": True}, on_mismatch="fail_step")],
+        )
+
+    receipt = json.loads(_latest_receipt(tmp_path / "out").read_text(encoding="utf-8"))
+    assert receipt["status"] == "failed"
+    step_data = receipt["steps"][0]
+    assert step_data["status"] == "failed"
+    assert step_data["error"]["type"] == "ProbeMismatch"
+
+
+def test_fileprobe_fail_run_on_mismatch_sets_integrity_failed(tmp_path: Path) -> None:
+    # fail_run keeps the step successful but flips final run status to integrity_failed.
+    with run("fileprobe-fail-run", out_dir=str(tmp_path / "out")):
+        exec(
+            [sys.executable, "-c", "pass"],
+            cwd=str(tmp_path),
+            probes=[FileProbe("b.txt", expect={"exists": True}, on_mismatch="fail_run")],
+        )
+
+    receipt = json.loads(_latest_receipt(tmp_path / "out").read_text(encoding="utf-8"))
+    assert receipt["status"] == "integrity_failed"
+    step_data = receipt["steps"][0]
+    assert step_data["status"] == "success"
+
+
+def test_fileprobe_size_expectations(tmp_path: Path) -> None:
+    target = tmp_path / "data.txt"
+    target.write_text("abcd", encoding="utf-8")
+
+    with run("fileprobe-size-expect", out_dir=str(tmp_path / "out")):
+        exec(
+            [sys.executable, "-c", "pass"],
+            cwd=str(tmp_path),
+            probes=[FileProbe("data.txt", expect={"min_size": 4, "max_size": 4, "size_eq": 4})],
+        )
+        exec(
+            [sys.executable, "-c", "pass"],
+            cwd=str(tmp_path),
+            probes=[FileProbe("data.txt", expect={"min_size": 10}, on_mismatch="record")],
+        )
+
+    receipt = json.loads(_latest_receipt(tmp_path / "out").read_text(encoding="utf-8"))
+    ok_measured = receipt["steps"][0]["measured_evidence"]["FileProbe:data.txt"]
+    bad_measured = receipt["steps"][1]["measured_evidence"]["FileProbe:data.txt"]
+    assert ok_measured["assertion"]["ok"] is True
+    assert bad_measured["assertion"]["ok"] is False
