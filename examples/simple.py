@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import tempfile
 from pathlib import Path
 
@@ -28,7 +29,17 @@ def main() -> None:
                 non_required_failure()
             except RuntimeError:
                 pass
-            exec(["cp", str(src), str(dst)], expect_files=[str(dst)], name="copy-file")
+            exec(
+                [
+                    sys.executable,
+                    "-c",
+                    "import shutil,sys; shutil.copy2(sys.argv[1], sys.argv[2])",
+                    str(src),
+                    str(dst),
+                ],
+                expect_files=[str(dst)],
+                name="copy-file",
+            )
 
         print(f"Receipt written to: {receipt_ctx.receipt_path}")
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -53,7 +54,16 @@ def test_exec_expect_files_recorded(tmp_path: Path) -> None:
     src.write_text("hello", encoding="utf-8")
 
     with run("exec-files", out_dir=str(tmp_path / "out")):
-        exec(["cp", str(src), str(dst)], expect_files=[str(dst), str(tmp_path / "missing.txt")])
+        exec(
+            [
+                sys.executable,
+                "-c",
+                "import shutil,sys; shutil.copy2(sys.argv[1], sys.argv[2])",
+                str(src),
+                str(dst),
+            ],
+            expect_files=[str(dst), str(tmp_path / "missing.txt")],
+        )
 
     receipt = json.loads(_latest_receipt(tmp_path / "out").read_text(encoding="utf-8"))
     exec_step = next(step for step in receipt["steps"] if step["kind"] == "exec")
