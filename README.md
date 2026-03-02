@@ -220,6 +220,14 @@ This protects against:
 
 ---
 
+
+## v0.2.2 Notes
+
+- `run(..., require_steps=[...])` defines an explicit required-step contract using stable keys like `function:<name>` and `exec:<name>`.
+- `run(..., auto_contract=True)` appends required function steps discovered from `@step(required=True)` registration (append-only; explicit `require_steps` remain authoritative and are never removed).
+- `@step` supports both sync and async functions correctly; async steps are only recorded after `await` completes.
+- `exec(..., expect_files=[...])` is kept for compatibility but is now soft-deprecated in favor of `FileProbe`; internally it routes through `FileProbe` evidence.
+
 # Threat Model & Boundaries
 
 RunProof does **not**:
