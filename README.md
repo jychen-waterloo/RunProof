@@ -8,190 +8,272 @@
 
 ## Why RunProof?
 
-Modern automation and AI agents can *decide* a lot —
-but they are surprisingly bad at **proving what they actually did**.
+Modern automation and AI agents can execute complex workflows.
+But when something goes wrong, one question is surprisingly hard to answer:
 
-Common failure modes:
+> Did it actually do what it claimed to do?
 
-* An agent *claims* it saved a record, but nothing was written.
-* A script partially ran, skipped a critical step, and still exited “success”.
-* State is scattered across logs, files, and databases — impossible to audit.
-* When something goes wrong, you cannot answer a simple question:
-  **“Which step failed, and what concrete artifacts were produced?”**
+Traditional logging tells you *what was printed*.
+Observability tells you *what was traced*.
+But neither guarantees:
 
-Traditional observability tools help you *see* execution.
+* Required steps actually ran
+* External state changed as expected
+* The run left measurable artifacts
 
-**RunProof exists to make execution *provable*.**
-
----
-
-## What is RunProof?
-
-RunProof is a lightweight execution integrity layer for automation.
-
-It wraps your existing code and produces a **verifiable execution receipt** for every run:
-
-* What steps ran
-* Which steps were required
-* What concrete evidence each step produced
-* Whether the run actually satisfied its integrity conditions
-
-RunProof does **not** prove correctness.
-It proves **that execution happened and left real artifacts**.
+RunProof introduces **execution receipts with integrity checks and side-effect verification**.
 
 ---
 
-## What RunProof is *not*
+# What RunProof Proves (and What It Doesn’t)
 
-To avoid confusion, RunProof is **not**:
+RunProof distinguishes between two kinds of proof:
 
-* ❌ A workflow engine
-* ❌ An AI agent framework
-* ❌ A logging or tracing system
-* ❌ A formal verification or correctness proof tool
+## 1 Execution Proof
 
-RunProof sits *below* agents and workflows.
+Execution proof answers:
 
-It answers one question only:
+> Did this step run?
 
-> **Did this run actually do what it was supposed to do?**
+Each step records:
+
+* Entry & exit
+* Duration
+* Status
+* Errors (if any)
+
+Required steps define **run integrity**.
+If a required step did not successfully execute, the run is marked:
+
+```
+integrity_failed
+```
+
+This prevents silent partial execution.
 
 ---
 
-## Core Idea: Execution Receipts
+## 2 Side-effect Verification (State Proof)
 
-Every run produces a **receipt**.
+Execution alone is not enough.
 
-A receipt is a structured, human-readable record containing:
+A function can return:
 
-* Run metadata (start, end, status)
-* A list of executed steps
-* For each step:
+```python
+return {"rows_inserted": 1}
+```
 
-  * Whether it was required
-  * Whether it succeeded
-  * Verifiable evidence (rows written, files created, exit codes, hashes, etc.)
+But did the database actually change?
 
-Example (simplified):
+To address this, RunProof introduces **Evidence Probes**.
+
+Probes independently measure external state changes before and after a step:
+
+* Files
+* Databases
+* HTTP responses
+* System commands
+
+This produces **measured evidence**, distinct from developer-reported values.
+
+---
+
+# Evidence Model
+
+Each step may contain two types of evidence:
+
+### Reported Evidence
+
+Returned directly by the wrapped function.
+
+Example:
 
 ```json
 {
-  "run": "leetcode-session",
-  "status": "failed (integrity)",
-  "steps": [
-    { "name": "fetch_state", "status": "success" },
-    {
-      "name": "write_record",
-      "required": true,
-      "status": "missing"
-    }
-  ]
+  "rows_inserted": 1
 }
 ```
 
-If a required step did not leave evidence, the run **fails**, even if no exception occurred.
+This is useful but not authoritative.
 
 ---
 
-## Design Principles
+### Measured Evidence (via Probes)
 
-### 1. Runs are transactions, not logs
+Captured independently by RunProof.
 
-A run either produces a complete receipt — or it fails.
+Example (FileProbe):
 
-Silent success is considered a bug.
+```json
+{
+  "file": "output.txt",
+  "before": {"exists": false},
+  "after": {
+    "exists": true,
+    "size": 1024,
+    "mtime": "..."
+  }
+}
+```
 
----
-
-### 2. Evidence beats text
-
-RunProof does not trust strings like:
-
-> “Saved successfully.”
-
-It trusts **evidence**, such as:
-
-* Rows inserted
-* Files created
-* Hashes changed
-* Exit codes returned
-
-If there is no evidence, the step did not happen.
+Measured evidence provides stronger guarantees.
 
 ---
 
-### 3. Minimal surface, maximal clarity
+# Evidence Levels
 
-RunProof is intentionally small:
+Not all steps require the same verification strength.
 
-* Single-process
-* Single-machine
-* Local JSON receipts
-* No databases
-* No SaaS dependency
+RunProof supports configurable Evidence Levels:
 
-It is designed to be *understood*, not hidden.
+### Level 0 — Reported Only
+
+* Records execution metadata
+* Stores reported return values
+* Lowest overhead
+
+### Level 1 — Light Verification (Default for Probes)
+
+* File existence
+* File size / mtime
+* DB row count
+* Command exit code
+
+Balanced performance and assurance.
+
+### Level 2 — Strict Verification
+
+* Cryptographic file hash (e.g. SHA256)
+* Stronger consistency checks
+
+Higher cost, stronger guarantee.
+
+*(Future roadmap may include tamper-evident receipts.)*
 
 ---
 
-## A Minimal Example
+# FileProbe (First Built-in Probe)
+
+The first built-in probe is `FileProbe`.
+
+It verifies file system side effects:
+
+* File existence
+* Size
+* Modification time
+* Optional hash (strict mode)
+
+Example:
 
 ```python
-from runproof import run, step
+from runproof import run, exec, FileProbe
 
-@step(required=True)
-def write_record(db, data):
-    return {"rows_inserted": db.insert(data)}
-
-with run("leetcode-session"):
-    write_record(db, session)
+with run("file-demo"):
+    exec(
+        ["cp", "a.txt", "b.txt"],
+        probes=[
+            FileProbe("b.txt", level=1)
+        ],
+        required=True,
+    )
 ```
 
-After execution, you get a receipt:
+Receipt excerpt:
 
-```bash
-$ runproof view receipt.json
-
-Run: leetcode-session
-Status: FAILED (integrity)
-
-✔ write_record
-  evidence: rows_inserted = 0
+```json
+{
+  "step": "exec: cp",
+  "status": "success",
+  "measured_evidence": {
+    "FileProbe": {
+      "before": {"exists": false},
+      "after": {
+        "exists": true,
+        "size": 12
+      }
+    }
+  }
+}
 ```
+
+If the file does not appear, the discrepancy is visible in the receipt.
 
 ---
 
-## Who Is This For?
+# Integrity Model
 
-RunProof is useful when **execution trust matters**:
+Run status priority:
 
-* Automation scripts
-* Data pipelines
-* AI agents and tool-using LLMs
-* DevOps workflows
-* Research experiments
-* Compliance-sensitive processes
+```
+integrity_failed > failed > success
+```
 
-If you have ever asked:
+A run fails integrity if:
 
-> “Did it actually run, or did it just say it did?”
+* Any required step never successfully executed.
 
-RunProof is for you.
+This protects against:
+
+* Silent partial runs
+* Early returns
+* Conditional skip errors
 
 ---
 
-## Project Status
+# Threat Model & Boundaries
 
-RunProof is an early-stage open-source project.
+RunProof does **not**:
 
-Current focus:
+* Prove program correctness
+* Prevent malicious code from fabricating return values
+* Monitor operations outside its execution gates
+
+RunProof can only prove what passes through its execution wrappers.
+
+However, by combining:
+
+* Structured execution receipts
+* Required-step integrity
+* Independent side-effect probes
+
+It significantly raises the trust level of automation workflows.
+
+---
+
+# Roadmap
+
+v0.1
 
 * Execution receipts
-* Required-step integrity checks
-* Local inspection tools
+* Required-step integrity
+* Command execution wrapper
+* Evidence truncation safeguards
 
-Future work will build on this foundation.
+v0.2
 
+* FileProbe
+* Evidence Levels
+* Measured vs Reported evidence separation
+
+v0.3+
+
+* DBProbe
+* HTTPProbe
+* Tamper-evident receipts
+* Run index & inspection tooling
+
+---
+
+# Summary
+
+RunProof moves automation from:
+
+> “It probably ran.”
+
+to
+
+> “It ran, and here is the evidence.”
+> 
 ---
 
 ## License
