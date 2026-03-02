@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextvars
 import dataclasses
 import datetime as dt
+import inspect
 import json
 import os
 import pathlib
@@ -11,7 +12,9 @@ import traceback
 import uuid
 from typing import Any
 
+from . import contract
 from .probes import Probe
+from .probes import FileProbe
 
 ISO_UTC = "%Y-%m-%dT%H:%M:%S.%fZ"
 
@@ -28,6 +31,7 @@ class StepRecord:
     started_at: str
     ended_at: str
     duration_ms: int
+    seq: int
     args_summary: dict[str, Any] | None = None
     reported_evidence: Any | None = None
     measured_evidence: dict[str, Any] | None = None
@@ -53,6 +57,7 @@ class RunReceipt:
     duration_ms: int
     status: str
     tags: dict[str, Any] | None
+    missing_required_steps: list[str]
     steps: list[StepRecord]
 
     def to_dict(self) -> dict[str, Any]:
@@ -62,17 +67,28 @@ class RunReceipt:
 
 
 class RunContext:
-    def __init__(self, name: str, out_dir: str | None = None, tags: dict | None = None):
+    def __init__(
+        self,
+        name: str,
+        out_dir: str | None = None,
+        tags: dict | None = None,
+        require_steps: list[str] | None = None,
+        auto_contract: bool = False,
+    ):
         self.name = name
         self.tags = tags
         self.out_dir = pathlib.Path(out_dir or ".runproof")
         self.run_id = str(uuid.uuid4())
         self.started_dt = _now()
         self.steps: list[StepRecord] = []
-        self.required_tracker: dict[str, bool] = {}
+        discovered = contract.get_registered_required_steps() if auto_contract else []
+        self.expected_required_steps = contract.merge_required_steps(require_steps, discovered)
+        self.fulfilled_required_steps: set[str] = set()
+        self.missing_required_steps: list[str] = []
         self.integrity_failed = False
         self.run_exception: BaseException | None = None
         self.receipt_path: pathlib.Path | None = None
+        self._seq = 0
 
     def __enter__(self) -> "RunContext":
         self._token = _current_run.set(self)
@@ -85,7 +101,7 @@ class RunContext:
         ended = _now()
         status = self._compute_status()
         receipt = RunReceipt(
-            version="0.2.1",
+            version="0.2.2",
             run_id=self.run_id,
             name=self.name,
             started_at=_fmt_dt(self.started_dt),
@@ -93,6 +109,7 @@ class RunContext:
             duration_ms=_duration_ms(self.started_dt, ended),
             status=status,
             tags=self.tags,
+            missing_required_steps=self.missing_required_steps,
             steps=self.steps,
         )
         run_dir = self.out_dir / "runs" / self.run_id
@@ -113,12 +130,20 @@ class RunContext:
 
     def _compute_status(self) -> str:
         any_failed = any(step.status == "failed" for step in self.steps)
-        integrity_ok = all(self.required_tracker.values()) if self.required_tracker else True
-        if not integrity_ok or self.integrity_failed:
+        self.missing_required_steps = [
+            key for key in self.expected_required_steps if key not in self.fulfilled_required_steps
+        ]
+        integrity_contract_missing = bool(self.expected_required_steps) and bool(self.missing_required_steps)
+        if integrity_contract_missing or self.integrity_failed:
             return "integrity_failed"
         if any_failed or self.run_exception is not None:
             return "failed"
         return "success"
+
+    def next_seq(self) -> int:
+        seq = self._seq
+        self._seq += 1
+        return seq
 
 
 def _now() -> dt.datetime:
@@ -199,11 +224,11 @@ def _record_step(step: StepRecord) -> None:
     ctx = _current_run.get()
     if ctx is None:
         return
+    step.seq = ctx.next_seq()
     ctx.steps.append(step)
-    if step.required:
+    if step.status == "success":
         key = f"{step.kind}:{step.name}"
-        prev = ctx.required_tracker.get(key, False)
-        ctx.required_tracker[key] = prev or step.status == "success"
+        ctx.fulfilled_required_steps.add(key)
 
 
 def _probe_ctx(
@@ -285,21 +310,32 @@ def _apply_probe_mismatch_policy(record: StepRecord) -> None:
         }
 
 
-def run(name: str, *, out_dir: str | None = None, tags: dict | None = None) -> RunContext:
-    return RunContext(name=name, out_dir=out_dir, tags=tags)
+def run(
+    name: str,
+    *,
+    out_dir: str | None = None,
+    tags: dict | None = None,
+    require_steps: list[str] | None = None,
+    auto_contract: bool = False,
+) -> RunContext:
+    return RunContext(
+        name=name,
+        out_dir=out_dir,
+        tags=tags,
+        require_steps=require_steps,
+        auto_contract=auto_contract,
+    )
 
 
 def step(name: str | None = None, *, required: bool = False, probes: list[Probe] | None = None):
     def decorator(func):
         step_name = name or func.__name__
+        if required:
+            # auto_contract captures required steps that have been imported/defined in-process.
+            contract.register_required_step(f"function:{step_name}")
 
-        def wrapper(*args, **kwargs):
-            ctx = _current_run.get()
-            if ctx is None:
-                return func(*args, **kwargs)
-
-            started = _now()
-            record = StepRecord(
+        def _make_record(args: tuple[Any, ...], kwargs: dict[str, Any], started: dt.datetime) -> StepRecord:
+            return StepRecord(
                 step_id=str(uuid.uuid4()),
                 name=step_name,
                 kind="function",
@@ -308,10 +344,11 @@ def step(name: str | None = None, *, required: bool = False, probes: list[Probe]
                 started_at=_fmt_dt(started),
                 ended_at=_fmt_dt(started),
                 duration_ms=0,
+                seq=-1,
                 args_summary=_args_summary(args, kwargs),
             )
-            active_probes = probes or []
-            probe_ctx = _probe_ctx(step_name=step_name, step_kind="function", started_at=record.started_at)
+
+        def _probe_snapshots(active_probes: list[Probe], probe_ctx: dict[str, Any]) -> dict[str, Any]:
             snapshots: dict[str, Any] = {}
             for probe in active_probes:
                 try:
@@ -321,6 +358,33 @@ def step(name: str | None = None, *, required: bool = False, probes: list[Probe]
                         "_probe_error": f"{type(exc).__name__}: {exc}",
                         "traceback": _truncate_text(traceback.format_exc(), 2000),
                     }
+            return snapshots
+
+        def _finalize_record(
+            record: StepRecord,
+            started: dt.datetime,
+            active_probes: list[Probe],
+            probe_ctx: dict[str, Any],
+            snapshots: dict[str, Any],
+        ) -> None:
+            if active_probes:
+                record.measured_evidence = _run_probe_post(active_probes, probe_ctx, snapshots)
+                _apply_probe_mismatch_policy(record)
+            ended = _now()
+            record.ended_at = _fmt_dt(ended)
+            record.duration_ms = _duration_ms(started, ended)
+            _record_step(record)
+
+        def _sync_wrapper(*args, **kwargs):
+            ctx = _current_run.get()
+            if ctx is None:
+                return func(*args, **kwargs)
+
+            started = _now()
+            record = _make_record(args, kwargs, started)
+            active_probes = probes or []
+            probe_ctx = _probe_ctx(step_name=step_name, step_kind="function", started_at=record.started_at)
+            snapshots = _probe_snapshots(active_probes, probe_ctx)
             try:
                 result = func(*args, **kwargs)
                 if _is_json_primitive(result):
@@ -334,13 +398,34 @@ def step(name: str | None = None, *, required: bool = False, probes: list[Probe]
                 record.error = _error_dict(exc)
                 raise
             finally:
-                if active_probes:
-                    record.measured_evidence = _run_probe_post(active_probes, probe_ctx, snapshots)
-                    _apply_probe_mismatch_policy(record)
-                ended = _now()
-                record.ended_at = _fmt_dt(ended)
-                record.duration_ms = _duration_ms(started, ended)
-                _record_step(record)
+                _finalize_record(record, started, active_probes, probe_ctx, snapshots)
+
+        async def _async_wrapper(*args, **kwargs):
+            ctx = _current_run.get()
+            if ctx is None:
+                return await func(*args, **kwargs)
+
+            started = _now()
+            record = _make_record(args, kwargs, started)
+            active_probes = probes or []
+            probe_ctx = _probe_ctx(step_name=step_name, step_kind="function", started_at=record.started_at)
+            snapshots = _probe_snapshots(active_probes, probe_ctx)
+            try:
+                result = await func(*args, **kwargs)
+                if _is_json_primitive(result):
+                    record.reported_evidence = _truncate_jsonable(result)
+                else:
+                    record.reported_evidence = {"_type": type(result).__name__, "_repr": _truncate_text(repr(result), 500)}
+                record.evidence = record.reported_evidence
+                return result
+            except Exception as exc:  # noqa: BLE001
+                record.status = "failed"
+                record.error = _error_dict(exc)
+                raise
+            finally:
+                _finalize_record(record, started, active_probes, probe_ctx, snapshots)
+
+        wrapper = _async_wrapper if inspect.iscoroutinefunction(func) else _sync_wrapper
 
         wrapper.__name__ = func.__name__
         wrapper.__doc__ = func.__doc__
@@ -374,8 +459,18 @@ def exec(
         started_at=_fmt_dt(started),
         ended_at=_fmt_dt(started),
         duration_ms=0,
+        seq=-1,
     )
-    active_probes = probes or []
+    active_probes = list(probes or [])
+    # Deprecated: prefer probes=[FileProbe(...)] over expect_files.
+    if expect_files:
+        existing_paths: set[str] = set()
+        for probe in active_probes:
+            if isinstance(probe, FileProbe):
+                existing_paths.add(probe.path)
+        for file_path in expect_files:
+            if file_path not in existing_paths:
+                active_probes.append(FileProbe(file_path, level=1, expect={"exists": True}, on_mismatch="record"))
     probe_ctx = _probe_ctx(step_name=step_name, step_kind="exec", started_at=record.started_at, cwd=cwd, cmd=cmd)
     snapshots: dict[str, Any] = {}
     for probe in active_probes:
@@ -404,20 +499,6 @@ def exec(
             "stdout_tail": _truncate_text(completed.stdout or "", 2000),
             "stderr_tail": _truncate_text(completed.stderr or "", 2000),
         }
-        if expect_files:
-            expected_files = {}
-            for file_path in expect_files:
-                p = pathlib.Path(file_path)
-                file_info: dict[str, Any] = {"exists": p.exists()}
-                if p.exists():
-                    stat = p.stat()
-                    file_info["stat"] = {
-                        "size": stat.st_size,
-                        "mtime": stat.st_mtime,
-                        "mode": stat.st_mode,
-                    }
-                expected_files[file_path] = file_info
-            evidence["expected_files"] = expected_files
         record.reported_evidence = evidence
         record.evidence = record.reported_evidence
         if completed.returncode != 0:

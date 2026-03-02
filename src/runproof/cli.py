@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import sys
 from pathlib import Path
+
+
+ISO_UTC = "%Y-%m-%dT%H:%M:%S.%fZ"
 
 
 def _brief_evidence(step: dict) -> str:
@@ -18,8 +22,6 @@ def _brief_evidence(step: dict) -> str:
         keys = ",".join(list(evidence.keys())[:3])
         return f"keys={keys}"
     return str(type(evidence).__name__)
-
-
 
 
 def _summarize_measured(step: dict) -> list[str]:
@@ -56,6 +58,31 @@ def _summarize_measured(step: dict) -> list[str]:
             lines.append(f"{probe_name}: keys={','.join(list(evidence.keys())[:3])}")
     return lines
 
+
+def _parse_time(value: str) -> dt.datetime:
+    return dt.datetime.strptime(value, ISO_UTC).replace(tzinfo=dt.timezone.utc)
+
+
+def _step_sort_key(step: dict) -> tuple[dt.datetime, int]:
+    started_raw = step.get("started_at")
+    try:
+        started = _parse_time(started_raw)
+    except Exception:  # noqa: BLE001
+        started = dt.datetime.max.replace(tzinfo=dt.timezone.utc)
+    return (started, int(step.get("seq", 0)))
+
+
+def _relative_window(step: dict, run_start: dt.datetime) -> str:
+    try:
+        started = _parse_time(step["started_at"])
+        ended = _parse_time(step["ended_at"])
+    except Exception:  # noqa: BLE001
+        return ""
+    rel_start = int((started - run_start).total_seconds() * 1000)
+    rel_end = int((ended - run_start).total_seconds() * 1000)
+    return f" [+{rel_start}ms → +{rel_end}ms]"
+
+
 def view(receipt_path: str) -> int:
     path = Path(receipt_path)
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -65,11 +92,18 @@ def view(receipt_path: str) -> int:
     print(f"Started: {data['started_at']}")
     print(f"Ended: {data['ended_at']}")
     print(f"Duration: {data['duration_ms']} ms")
+    missing = data.get("missing_required_steps") or []
+    if missing:
+        print(f"Missing required steps: {', '.join(missing)}")
     print("Steps:")
-    for step in data.get("steps", []):
+    print("  Displayed in start-time order; steps may overlap due to concurrency.")
+    run_start = _parse_time(data["started_at"])
+    sorted_steps = sorted(data.get("steps", []), key=_step_sort_key)
+    for step in sorted_steps:
         mark = "[x]" if step.get("status") == "success" else "[ ]"
         brief = _brief_evidence(step)
-        print(f"  {mark} {step.get('name')} ({step.get('kind')}, required={step.get('required')}) {brief}")
+        rel = _relative_window(step, run_start)
+        print(f"  {mark} {step.get('name')} ({step.get('kind')}, required={step.get('required')}) {brief}{rel}")
         for measured_line in _summarize_measured(step):
             print(f"      - {measured_line}")
 
